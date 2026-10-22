@@ -762,13 +762,7 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
-                        preempted_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
-                        )
-                    else:
-                        preempted_req = self.running[-1]
+                    preempted_req = self._select_preemption_victim(request)
 
                     # A deferred free will not help with immediate allocation.
                     if not self._request_blocks_can_be_freed(preempted_req):
@@ -1534,6 +1528,22 @@ class Scheduler(SchedulerInterface):
             skip.clear()
 
         return new_block_ids_to_zero or None
+
+
+
+    def _select_preemption_victim(self, request: Request) -> Request:
+        """Pick the running request to evict when `request` cannot get KV blocks.
+
+        Overridable hook. The caller removes the victim from `running` and, under
+        the priority policy, undoes its scheduling in the current step if it was
+        already scheduled. Under FCFS the caller pops `running[-1]`, so overrides
+        must return `running[-1]` for that policy.
+        """
+        if self.policy == SchedulingPolicy.PRIORITY:
+            return max(self.running, key=lambda r: (r.priority, r.arrival_time))
+        return self.running[-1]
+
+
 
     def _preempt_request(
         self, request: Request, timestamp: float, drop_stale_output: bool = False
