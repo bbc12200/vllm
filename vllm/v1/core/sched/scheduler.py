@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os          # ← 新增
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -119,6 +120,15 @@ class Scheduler(SchedulerInterface):
         )
         # Track requests scheduled in prior step (MRV1-only).
         self.prev_step_scheduled_req_ids: set[str] = set()
+
+        # Seat preemption (priority policy only). See _pick_seat_victim.
+        self.seat_preempt_wait_s = (
+            float(os.environ.get("VLLM_SEAT_PREEMPT_WAIT_MS", "400")) / 1000
+        )
+        self.seat_preempt_max_per_req = int(
+            os.environ.get("VLLM_SEAT_PREEMPT_MAX_PER_REQ", "1")
+        )
+        self.num_seat_preemptions = 0
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -885,8 +895,34 @@ class Scheduler(SchedulerInterface):
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_active_reqs:
-                    break
-
+                    victim = self._pick_seat_victim(request_queue.peek_request())
+                    if victim is None:
+                        break                                   # 挑不到人，照原本放棄
+                    victim_id = victim.request_id
+                    self.running.remove(victim)
+                    if victim in scheduled_running_reqs:
+                        # 這一步已經排過它了，把扣掉的預算退回來
+                        scheduled_running_reqs.remove(victim)
+                        restored = num_scheduled_tokens.pop(victim_id)
+                        token_budget += restored
+                        input_budget += restored + draft_slots
+                        req_to_new_blocks.pop(victim_id)
+                        scheduled_spec_decode_tokens.pop(victim_id, None)
+                        victim_encoder_inputs = scheduled_encoder_inputs.pop(
+                            victim_id, None
+                        )
+                        if victim_encoder_inputs:
+                            encoder_compute_budget += sum(
+                                victim.get_num_encoder_embeds(i)
+                                for i in victim_encoder_inputs
+                            )
+                    self._preempt_request(
+                        victim,
+                        scheduled_timestamp,
+                        drop_stale_output=self.requires_kv_delivery,
+                    )
+                    self.num_seat_preemptions += 1
+                    continue                                    # 空出座位，下一圈讓高優先級進來               
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
@@ -1544,6 +1580,24 @@ class Scheduler(SchedulerInterface):
         return self.running[-1]
 
 
+    def _pick_seat_victim(self, request: Request) -> Request | None:
+        """Pick a running request to evict so `request` can take its seat."""
+        if self.policy != SchedulingPolicy.PRIORITY:
+            return None
+        if self._is_blocked_waiting_status(request.status):
+            return None
+        if time.time() - request.arrival_time < self.seat_preempt_wait_s:
+            return None
+        candidates = [
+            r
+            for r in self.running
+            if r.priority > request.priority
+            and r.num_preemptions < self.seat_preempt_max_per_req
+            and self._request_blocks_can_be_freed(r)
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda r: r.num_computed_tokens)
 
     def _preempt_request(
         self, request: Request, timestamp: float, drop_stale_output: bool = False
