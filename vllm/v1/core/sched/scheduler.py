@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm.v1.core.sched._nvtx import nvtx_annotate, nvtx_range
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -569,6 +570,7 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    @nvtx_annotate("sched.schedule")
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -772,7 +774,8 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
-                    preempted_req = self._select_preemption_victim(request)
+                    with nvtx_range("sched.kv_victim"):
+                        preempted_req = self._select_preemption_victim(request)
 
                     # A deferred free will not help with immediate allocation.
                     if not self._request_blocks_can_be_freed(preempted_req):
@@ -1580,6 +1583,7 @@ class Scheduler(SchedulerInterface):
         return self.running[-1]
 
 
+    @nvtx_annotate("sched.seat_victim")
     def _pick_seat_victim(self, request: Request) -> Request | None:
         """Pick a running request to evict so `request` can take its seat."""
         if self.policy != SchedulingPolicy.PRIORITY:
@@ -1599,6 +1603,7 @@ class Scheduler(SchedulerInterface):
             return None
         return min(candidates, key=lambda r: r.num_computed_tokens)
 
+    @nvtx_annotate("sched.preempt")
     def _preempt_request(
         self, request: Request, timestamp: float, drop_stale_output: bool = False
     ) -> None:
